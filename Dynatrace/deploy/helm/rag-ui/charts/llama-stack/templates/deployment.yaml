@@ -43,6 +43,9 @@ spec:
             {{- toYaml .Values.args | nindent 12 }}
           env:
             {{- toYaml .Values.env | nindent 12 }}
+          envFrom:
+          - secretRef:
+              name: {{ .Chart.Name }}-env
           ports:
             - name: http
               containerPort: {{ .Values.service.port }}
