@@ -169,7 +169,7 @@ install-metric-ui: namespace
 
 
 .PHONY: install-ui
-install-ui: namespace list-models-to-configmap install-prometheus install-metric-ui 
+install-ui: namespace list-models-to-configmap install-prometheus install-metric-ui install-rag-ui
 	@$(eval HELM_ARGS := $(call helm_llama_stack_args))
 	@$(MAKE) install-prometheus
 
