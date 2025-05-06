@@ -1,4 +1,4 @@
-# Makefile for AI Metric Summarizer Deployment
+# Makefile for RAG Deployment
 # Replaces the original deploy.sh script with additional uninstall functionality
 
 ifeq ($(NAMESPACE),)
@@ -8,14 +8,43 @@ endif
 endif
 
 # Default values
+POSTGRES_USER ?= postgres
+POSTGRES_PASSWORD ?= rag_password
+POSTGRES_DBNAME ?= rag_blueprint
+MINIO_USER ?= minio_rag_user
+MINIO_PASSWORD ?= minio_rag_password
+RELEASE_NAME ?= rag
+CHART_PATH ?= rag-ui
 HF_TOKEN ?= $(shell bash -c 'read -r -p "Enter Hugging Face Token: " HF_TOKEN; echo $$HF_TOKEN')
+DT_API_TOKEN ?= $(shell bash -c 'read -r -p "Enter Dynatrace API Token: " HF_TOKEN; echo $$DT_API_TOKEN')
 LLM_SERVICE_CHART_PATH ?= llm-service
 LLM_SERVICE_RELEASE_NAME ?= llm-service
-METRIC_UI_CHART_PATH ?= metric-ui
-METRIC_UI_RELEASE_NAME ?= metric-ui
-PROMETHEUS_CHART_PATH ?= prometheus
-PROMETHEUS_RELEASE_NAME ?= prometheus
+MCP_SERVERS_CHART_PATH ?= mcp-servers
+MCP_SERVERS_RELEASE_NAME ?= mcp-servers
+INGESTION_PIPELINE_CHART_PATH ?= ingestion-pipeline
+INGESTION_PIPELINE_RELEASE_NAME ?= ingestion-pipeline
+CONFIGURE_PIPELINE_SERVER_CHART_PATH ?= configure-pipeline-server
+CONFIGURE_PIPELINE_SERVER_RELEASE_NAME ?= configure-pipeline-server
 TOLERATIONS_TEMPLATE=[{"key":"$(1)","effect":"NoSchedule","operator":"Exists"}]
+OTEL_COLLECTOR_CHART_PATH ?= otel-collector
+OTEL_COLLECTOR_RELEASE_NAME ?= otel-collector
+
+
+#ingestion pipeline configuration
+SOURCE ?= S3
+EMBEDDING_MODEL ?= all-MiniLM-L6-v2
+INGESTION_PIPELINE_NAME ?= demo-rag-vector-db
+INGESTION_PIPELINE_VERSION ?= 1.0
+ACCESS_KEY_ID ?= $(MINIO_USER)
+SECRET_ACCESS_KEY ?= $(MINIO_PASSWORD)
+BUCKET_NAME ?= documents
+ENDPOINT_URL ?= http://minio:9000
+REGION ?= us-east-1
+# PDF file path variable for upload-pdf target
+PDF_FILE = ../../notebooks/Zippity_Zoo.pdf
+
+S3_TEMPLATE={"access_key_id":"$(1)","secret_access_key":"$(2)","bucket_name":"$(3)","endpoint_url":"$(4)","region":"$(5)"}
+
 
 # Default target
 .PHONY: help
@@ -40,10 +69,37 @@ help:
 	@echo "  {SAFETY,LLM}_TOLERATION  - Model pod toleration"
 
 # Create namespace and deploy
-.PHONY: namespace
 namespace:
-	@echo "Creating namespace $(NAMESPACE)..."
-	oc create namespace $(NAMESPACE) && oc label namespace $(NAMESPACE) modelmesh-enabled=false || oc project $(NAMESPACE) ||:
+	oc create namespace $(NAMESPACE) && oc label namespace $(NAMESPACE) modelmesh-enabled=false ||:
+	oc project $(NAMESPACE) ||:
+
+.PHONY: install-mcp-servers
+install-mcp-servers: namespace
+
+	@echo "Deploying Helm chart $(MCP_SERVERS_CHART_PATH) as release $(MCP_SERVERS_RELEASE_NAME) in namespace $(NAMESPACE)..."
+	helm upgrade --install $(MCP_SERVERS_RELEASE_NAME) $(MCP_SERVERS_CHART_PATH) -n $(NAMESPACE)
+
+.PHONY: configure-pipeline-server
+configure-pipeline-server: namespace
+
+	@echo "Deploying Helm chart $(CONFIGURE_PIPELINE_SERVER_CHART_PATH) as release $(CONFIGURE_PIPELINE_SERVER_RELEASE_NAME) in namespace $(NAMESPACE)..."
+	helm upgrade --install $(CONFIGURE_PIPELINE_SERVER_RELEASE_NAME) $(CONFIGURE_PIPELINE_SERVER_CHART_PATH) -n $(NAMESPACE)
+
+
+set_ingestion_args = \
+	$(if $(SOURCE),--set source='$(SOURCE)',) \
+	$(if $(EMBEDDING_MODEL),--set embedding_model='$(EMBEDDING_MODEL)',) \
+	$(if $(INGESTION_PIPELINE_NAME),--set name='$(INGESTION_PIPELINE_NAME)',) \
+	$(if $(INGESTION_PIPELINE_VERSION),--set version='$(INGESTION_PIPELINE_VERSION)',) \
+    $(if $(SOURCE),--set-json S3='$(call S3_TEMPLATE,$(ACCESS_KEY_ID),$(SECRET_ACCESS_KEY),$(BUCKET_NAME),$(ENDPOINT_URL),$(REGION))',)
+
+.PHONY: create-ingestion-pipeline
+create-ingestion-pipeline: namespace
+
+	@$(eval INGESTION_ARGS := $(call set_ingestion_args))
+
+	@echo "Deploying Helm chart $(INGESTION_PIPELINE_CHART_PATH) as release $(INGESTION_PIPELINE_RELEASE_NAME) in namespace $(NAMESPACE)..."
+	helm upgrade --install $(INGESTION_PIPELINE_RELEASE_NAME) $(INGESTION_PIPELINE_CHART_PATH) -n $(NAMESPACE) $(INGESTION_ARGS) ||:
 
 list-models-%:
 	@helm template dummy-release $(LLM_SERVICE_CHART_PATH) --set _debugListModels=true --values $(LLM_SERVICE_CHART_PATH)/values-$*.yaml |grep ^model
@@ -62,108 +118,89 @@ install-llm-service-%: namespace
 
 	@echo "Deploying Helm chart $(LLM_SERVICE_CHART_PATH) as release $(LLM_SERVICE_RELEASE_NAME) in namespace $(NAMESPACE)..."; \
 	helm upgrade --install $(LLM_SERVICE_RELEASE_NAME) $(LLM_SERVICE_CHART_PATH) -n $(NAMESPACE) --values $(LLM_SERVICE_CHART_PATH)/values-$*.yaml \
-		--set hf_token=$(HF_TOKEN) $(HELM_ARGS) $(EXTRA_HELM_ARGS)
+		--set secret.hf_token=$(HF_TOKEN) $(HELM_ARGS) $(EXTRA_HELM_ARGS)
 	@echo "Waiting for model services to deploy. It will take around 10-15 minutes depending on the size of the model..."
 	oc wait -n $(NAMESPACE) --for=condition=Ready --timeout=60m inferenceservice --all ||:
 
 .PHONY: install-llm-service
 install-llm-service: install-llm-service-gpu
 
-.PHONY: list-models-to-configmap
-list-models-to-configmap: namespace
-	@echo "Generating model ID list from values-gpu.yaml for specified models: $(LLM) $(SAFETY)..."
+helm_llama_stack_args = \
+    --set pgvector.secret.user=$(POSTGRES_USER) \
+    --set pgvector.secret.password=$(POSTGRES_PASSWORD) \
+    --set pgvector.secret.dbname=$(POSTGRES_DBNAME) \
+    --set minio.secret.user=$(MINIO_USER) \
+    --set minio.secret.password=$(MINIO_PASSWORD) \
+    $(if $(LLM),--set-json llama-stack.models.$(LLM).enabled='true',) \
+    $(if $(SAFETY),--set-json llama-stack.models.$(SAFETY).enabled='true',) \
+    $(if $(LLM_URL),--set-json llama-stack.models.$(LLM).url='"$(LLM_URL)"',) \
+    $(if $(SAFETY_URL),--set-json llama-stack.models.$(SAFETY).url='"$(SAFETY_URL)"',) \
+    $(if $(LLM_API_TOKEN),--set-json llama-stack.models.$(LLM).apiToken='"$(LLM_API_TOKEN)"',) \
+    $(if $(SAFETY_API_TOKEN),--set-json llama-stack.models.$(SAFETY).apiToken='"$(SAFETY_API_TOKEN)"',) \
+    $(if $(LLAMA_STACK_ENV),--set-json llama-stack.secrets='$(LLAMA_STACK_ENV)',)
 
-	@touch tmp-models.json
-	@echo "[]" > tmp-models.json
+.PHONY: create-minio-bucket
+create-minio-bucket:
+	oc wait -n $(NAMESPACE) --for=condition=Ready pod/minio-0 --timeout=300s
+	sleep 5
+	oc exec -n $(NAMESPACE) minio-0 -- bash -c "mc alias set local http://localhost:9000 $(MINIO_USER) $(MINIO_PASSWORD) && mc mb local/$(BUCKET_NAME)" ||:
 
-	@if [ -n "$(LLM)" ]; then \
-		id=$$(yq e '.models.$(LLM).id' $(LLM_SERVICE_CHART_PATH)/values-gpu.yaml); \
-		if [ "$$id" != "null" ]; then \
-			jq --arg id "$$id" '. + [$$id]' tmp-models.json > tmp-models.json.new && mv tmp-models.json.new tmp-models.json; \
-		fi; \
-	fi
+.PHONY: upload-pdf
+upload-pdf:
+	@echo "Uploading PDF file $(PDF_FILE) to Minio bucket $(BUCKET_NAME)..."
+	@test -f "$(PDF_FILE)" || { echo "Error: File $(PDF_FILE) not found"; exit 1; }
+	@echo "Waiting for minio-0 pod to be ready..."
+	oc wait -n $(NAMESPACE) --for=condition=Ready pod/minio-0 --timeout=60s
+	@echo "Creating temporary file in minio pod..."
+	cat "$(PDF_FILE)" | oc exec -i -n $(NAMESPACE) minio-0 -- bash -c "cat > /tmp/$(shell basename $(PDF_FILE))"
+	@echo "Uploading file to bucket..."
+	oc exec -n $(NAMESPACE) minio-0 -- bash -c "mc alias set local http://localhost:9000 $(MINIO_USER) $(MINIO_PASSWORD) && mc cp /tmp/$(shell basename $(PDF_FILE)) local/$(BUCKET_NAME)/ && rm /tmp/$(shell basename $(PDF_FILE))"
+	@echo "PDF file $(PDF_FILE) uploaded successfully to Minio bucket $(BUCKET_NAME)"
 
-	@if [ -n "$(SAFETY)" ]; then \
-		id=$$(yq e '.models.$(SAFETY).id' $(LLM_SERVICE_CHART_PATH)/values-gpu.yaml); \
-		if [ "$$id" != "null" ]; then \
-			jq --arg id "$$id" '. + [$$id]' tmp-models.json > tmp-models.json.new && mv tmp-models.json.new tmp-models.json; \
-		fi; \
-	fi
-
-	@echo "tmp-models.json content:" && cat tmp-models.json
-
-MODELS_JSON := $(shell cat tmp-models.json)
-
-
-.PHONY: install-prometheus
-install-prometheus: namespace
-	@echo "Deploying Prometheus Helm release..."
-	helm upgrade --install $(PROMETHEUS_RELEASE_NAME) $(PROMETHEUS_CHART_PATH) -n $(NAMESPACE)
-
-	@echo "Waiting for Prometheus operator CSV to be Succeeded..."
-	oc wait --for=jsonpath='{.status.phase}'=Succeeded csv -n $(NAMESPACE) -l operators.coreos.com/prometheus.$(NAMESPACE) --timeout=10m || \
-	echo "Timed out waiting for CSV"
-
-	@echo "Waiting for Prometheus operator controller pod to be Ready..."
-	oc wait --for=condition=Ready pod -n $(NAMESPACE) -l app.kubernetes.io/component=controller --timeout=5m || \
-	echo "Timed out waiting for controller pod"
-
-	sleep 30;
-
-
-.PHONY: install-metric-ui
-install-metric-ui: namespace
-	@echo "Extracting LLM service URL"
-	LLM_URL=$$(oc get inferenceservice llama-3-2-3b-instruct -n $(NAMESPACE) -o jsonpath='{.status.url}'); \
-	echo "Detected LLM_URL=$$LLM_URL"; \
-	echo "Detected MODEL_JSON=$$MODELS_JSON"; \
-	helm upgrade --install $(METRIC_UI_RELEASE_NAME) $(METRIC_UI_CHART_PATH) \
-		-n $(NAMESPACE) \
-		--set-json llm.url="\"$$LLM_URL\"" \
-		--set-json listModels.modelId.enabledModelIds='$(MODELS_JSON)'
-
-.PHONY: install-rag
-install-rag: namespace
-	@$(eval HELM_ARGS := $(call helm_llama_stack_args))
-    
-	@echo "Deploying the llamastack.."
-	@echo "Deploying Helm chart $(CHART_PATH) as release $(RELEASE_NAME) in namespace $(NAMESPACE)..."
-	helm upgrade --install $(RELEASE_NAME) $(CHART_PATH) -n $(NAMESPACE) $(HELM_ARGS) $(EXTRA_HELM_ARGS)
+.PHONY: install-otel-collector
+install-rag: namespace install-mcp-servers
+	@echo "Deploying OTEL COLLECTOR Helm chart $(OTEL_COLLECTOR_CHART_PATH) as release $(OTEL_COLLECTOR_RELEASE_NAME) in namespace $(NAMESPACE)..."
+	helm upgrade --install $(OTEL_COLLECTOR_RELEASE_NAME) $(OTEL_COLLECTOR_CHART_PATH) -n $(NAMESPACE) $(HELM_ARGS) $(EXTRA_HELM_ARGS)
 
 	@$(MAKE) create-minio-bucket
 	@$(MAKE) upload-pdf
 	@$(MAKE) status
-	@$(MAKE) configure-pipeline-server
-	@$(MAKE) create-ingestion-pipeline
-
 
 	@echo "Waiting for deployment to be ready..."
 	@$(MAKE) wait
 
-.PHONY: install-ui
-install-ui: namespace list-models-to-configmap install-prometheus install-metric-ui
+.PHONY: install-rag
+install-rag: namespace install-mcp-servers
 	@$(eval HELM_ARGS := $(call helm_llama_stack_args))
 
-	@$(MAKE) install-metric-ui
+	@echo "Deploying Helm chart $(CHART_PATH) as release $(RELEASE_NAME) in namespace $(NAMESPACE)..."
+	helm upgrade --install $(RELEASE_NAME) $(CHART_PATH) -n $(NAMESPACE) $(HELM_ARGS) $(EXTRA_HELM_ARGS)
+	  --set secret.dt_api_token=$(DT_API_TOKEN) $(HELM_ARGS) $(EXTRA_HELM_ARGS)
+
+	@$(MAKE) create-minio-bucket
+	@$(MAKE) upload-pdf
 	@$(MAKE) status
 
 	@echo "Waiting for deployment to be ready..."
 	@$(MAKE) wait
 
-install-%: install-llm-service-% install-rag
-	@echo "Installed from target install-$*"
+install-gpu: install-llm-service-gpu install-rag
+install-cpu: install-llm-service-cpu install-rag
 
 .PHONY: install
 install: install-gpu
 
 # Uninstall the deployment and clean up
 .PHONY: uninstall
-uninstall: uninstall-helm-release uninstall-llm-service uninstall-prometheus uninstall-metric-ui uninstall-configmap remove-secrets remove-pvcs
+uninstall: uninstall-helm-release uninstall-mcp-servers uninstall-ingestion-pipeline uninstall-llm-service remove-secrets remove-pvcs
+
+	@echo "Deleting remaining pods in namespace $(NAMESPACE)"
+	oc delete pods -n $(NAMESPACE) --all
 	@echo "Checking for any remaining resources in namespace $(NAMESPACE)..."
 	@echo "If you want to completely remove the namespace, run: oc delete project $(NAMESPACE)"
+
 	@echo "Remaining resources in namespace $(NAMESPACE):"
 	@$(MAKE) status
-
 
 .PHONY: uninstall-llm-service
 uninstall-llm-service:
@@ -171,20 +208,20 @@ uninstall-llm-service:
 	@echo "Uninstalling Helm release $(LLM_SERVICE_RELEASE_NAME) from namespace $(NAMESPACE)..."
 	helm uninstall $(LLM_SERVICE_RELEASE_NAME) -n $(NAMESPACE) || echo "LLM services are not installed or already removed."
 
-.PHONY: uninstall-prometheus
-uninstall-prometheus:
-	@echo "Uninstalling Prometheus Helm release..."
-	helm uninstall $(PROMETHEUS_RELEASE_NAME) -n $(NAMESPACE) || echo "Prometheus not installed or already removed."
+.PHONY: uninstall-mcp-servers
+uninstall-mcp-servers:
 
-.PHONY: uninstall-metric-ui
-uninstall-metric-ui:
-	@echo "Uninstalling Metric UI Helm release..."
-	helm uninstall $(METRIC_UI_RELEASE_NAME) -n $(NAMESPACE) || echo "Metric UI not installed or already removed."
+	@echo "Uninstalling Helm release $(MCP_SERVERS_RELEASE_NAME) from namespace $(NAMESPACE)..."
+	helm uninstall $(MCP_SERVERS_RELEASE_NAME) -n $(NAMESPACE) || echo "MCP servers are not installed or already removed."
 
-.PHONY: uninstall-configmap
-uninstall-configmap:
-	@echo "Deleting 'llm-models' ConfigMap..."
-	oc delete configmap llm-models -n $(NAMESPACE) || echo "ConfigMap not found or already removed."
+.PHONY: uninstall-ingestion-pipeline
+uninstall-ingestion-pipeline:
+
+	@echo "Uninstalling Helm release $(INGESTION_PIPELINE_RELEASE_NAME) from namespace $(NAMESPACE)..."
+	helm uninstall $(INGESTION_PIPELINE_RELEASE_NAME) -n $(NAMESPACE) || echo "Pipelines are not installed or already removed."
+
+	@echo "Uninstalling Helm release $(CONFIGURE_PIPELINE_SERVER_RELEASE_NAME) from namespace $(NAMESPACE)..."
+	helm uninstall $(CONFIGURE_PIPELINE_SERVER_RELEASE_NAME) -n $(NAMESPACE) || echo "Pipeline is not configured or already removed."
 
 
 .PHONY: uninstall-helm-release
@@ -193,13 +230,17 @@ uninstall-helm-release:
 	@echo "Uninstalling Helm release $(RELEASE_NAME) from namespace $(NAMESPACE)..."
 	helm uninstall $(RELEASE_NAME) -n $(NAMESPACE) || echo "Helm release not found or already removed."
 
+.PHONY: remove-secrets
+remove-secrets:
+
+	@echo "Removing pipeline secret"
+	oc delete secret -n $(NAMESPACE) rag-pipeline-secrets || echo "Secret not found or already removed."
 
 .PHONY: remove-pvcs
 remove-pvcs:
 
 	@echo "Removing pgvector and minio PVCs"
-	oc delete pvc -n $(NAMESPACE) $$(oc get pvc -n $(NAMESPACE) -o custom-columns=NAME:.metadata.name --no-headers | grep "^pg-data")
-	oc delete pvc -n $(NAMESPACE) $$(oc get pvc -n $(NAMESPACE) -o custom-columns=NAME:.metadata.name --no-headers | grep "^minio-data")
+	oc get pvc -n $(NAMESPACE) -o custom-columns=NAME:.metadata.name | grep -E '^(pg|minio)-data' | xargs oc delete pvc -n $(NAMESPACE) ||:
 
 # Check deployment status
 .PHONY: status
