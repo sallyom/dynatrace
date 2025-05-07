@@ -1,0 +1,66 @@
+{{- $root := . }}
+{{- range $key, $model := $.Values.models }}
+{{- if $model.enabled }}
+apiVersion: opentelemetry.io/v1beta1
+kind: OpenTelemetryCollector
+metadata:
+  name: {{ $key }}-otelsidecar
+spec:
+  mode: sidecar
+  env:
+    - name: DYNATRACE_ENDPOINT
+      valueFrom:
+        secretKeyRef:
+          name: dynatrace-otc-secret
+          key: endpoint
+    - name: DYNATRACE_API_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: dynatrace-otc-secret
+          key: apiToken
+  config:
+    exporters:
+      debug:
+        verbosity: detailed
+      otlphttp/dynatrace:
+        endpoint: ${DYNATRACE_ENDPOINT}
+        headers:
+          Authorization: Api-Token ${DYNATRACE_API_TOKEN}
+    processors:
+      batch:
+        send_batch_size: 100
+        timeout: 1s
+      cumulativetodelta: {}
+      memory_limiter:
+        check_interval: 5s
+        limit_percentage: 95
+        spike_limit_percentage: 25
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: '0.0.0.0:4317'
+          http:
+            endpoint: '0.0.0.0:4318'
+      prometheus:
+        config:
+          scrape_configs:
+            - job_name: {{ $key }}-serve
+              scrape_interval: 10s
+              static_configs:
+                - targets:
+                    - 'localhost:8000'
+    service:
+      pipelines:
+        metrics:
+          exporters:
+            - otlphttp/dynatrace
+            - debug
+          processors:
+            - memory_limiter
+            - cumulativetodelta
+            - batch
+          receivers:
+            - prometheus
+{{- end }}
+{{- end }}
