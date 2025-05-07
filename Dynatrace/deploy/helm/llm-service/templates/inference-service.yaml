@@ -15,6 +15,7 @@ metadata:
   labels:
     opendatahub.io/dashboard: "true"
     networking.knative.dev/visibility: "cluster-local"
+    sidecar.opentelemetry.io/inject: {{ $key }}-otelsidecar
 spec:
   predictor:
     maxReplicas: 1
