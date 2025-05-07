@@ -46,10 +46,10 @@ spec:
         config:
           scrape_configs:
             - job_name: {{ $key }}-serve
-              scrape_interval: 10s
+              scrape_interval: {{ .Values.dynatrace.scrape_interval }}
               static_configs:
                 - targets:
-                    - 'localhost:8000'
+                    - 'localhost:'{{ .Values.dynatrace.metrics_port }}
     service:
       pipelines:
         metrics:

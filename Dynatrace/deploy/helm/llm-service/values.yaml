@@ -24,3 +24,9 @@ servingRuntime:
     name: vllm-home
 
 hf_token: ""
+
+dynatrace:
+  endpoint: "https://your-endpoint.dynatrace.com/api/v2/otlp"  # Replace with your actual endpoint
+  apiToken: "your-api-token-here"  # Replace with your actual API token
+  metrics_port: "8012"
+  scrape_interval: "10s"
